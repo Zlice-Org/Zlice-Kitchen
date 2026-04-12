@@ -158,8 +158,8 @@ export async function proxy(request: NextRequest) {
     }
   }
 
-  // Verified canteen on verification pages → send them to dashboard
-  if (pathname === '/verification' && userType === 'canteen' && verificationStatus === 'verified') {
+  // Verified or under_review canteen on verification pages → send them to dashboard
+  if (pathname === '/verification' && userType === 'canteen' && (verificationStatus === 'verified' || verificationStatus === 'under_review')) {
     return NextResponse.redirect(new URL('/dashboard', request.url));
   }
 

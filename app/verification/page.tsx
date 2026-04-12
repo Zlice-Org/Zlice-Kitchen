@@ -121,7 +121,7 @@ export default function VerificationPage() {
 
       toast.success("Verification submitted! Redirecting...", { id: toastId });
       localStorage.removeItem("kitchen_verification_form");
-      router.push("/dashboard");
+      window.location.href = "/dashboard"; // Use hard navigation to bypass Next.js middleware cache
     } catch (error: any) {
       console.error("Submission error:", error);
       toast.error(error.message || "Failed to submit. Please check your connection and try again.", { id: toastId });
