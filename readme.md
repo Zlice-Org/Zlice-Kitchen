@@ -1,6 +1,6 @@
 # Canteen Management Tool
 
-A comprehensive solution for managing canteen  operations efficiently.
+A comprehensive solution for managing canteen  operations efficiently
 
 ## Features
 
