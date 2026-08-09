@@ -27,7 +27,8 @@ export interface KOTData {
 }
 
 // Import shared helpers from billing printer
-import { isWebBluetoothAvailable, printRawData, printViaUSB, getSavedPrinterId as getSharedPrinterId, applyExactPageSize } from './pwa-printer';
+import { isWebBluetoothAvailable, printRawData, printViaUSB, getSavedPrinterId as getSharedPrinterId } from './pwa-printer';
+import { printHTML } from './html-print';
 
 // Get saved printer ID (SHARED with billing)
 function getSavedPrinterId(): string | null {
@@ -110,7 +111,7 @@ export async function printKOT(kotData: KOTData, forceThermal?: boolean) {
   // If Bluetooth is disabled, skip thermal and go straight to HTML
   if (!bluetoothEnabled) {
     console.log('📄 Bluetooth disabled - using HTML print');
-    printKOTViaIframe(kotData);
+    await printKOTViaIframe(kotData);
     return;
   }
   
@@ -131,7 +132,7 @@ export async function printKOT(kotData: KOTData, forceThermal?: boolean) {
   }
   
   // Fallback to HTML (only if no Bluetooth printer is saved, or Bluetooth is disabled)
-  printKOTViaIframe(kotData);
+  await printKOTViaIframe(kotData);
 }
 
 /**
@@ -303,54 +304,22 @@ function addText(commands: number[], text: string) {
 }
 
 /**
- * Print KOT via iframe (HTML)
+ * Print KOT via the browser print dialog.
+ *
+ * Delegates to printHTML() instead of driving an iframe here. The hand-rolled
+ * version this replaces carried two faults that both ended as a ticket
+ * truncated after the header:
+ *
+ * 1. `iframe.onload` was assigned AFTER `iframeDoc.close()`. close() fires the
+ *    load event synchronously, so the handler could be attached too late and
+ *    print() was never reached at all.
+ * 2. The iframe was removed on a fixed 3s timer, tearing the source document
+ *    away while the browser was still generating the job. The printer got a
+ *    partial stream and sat waiting for the rest, wedging the queue until it
+ *    was power-cycled.
  */
-function printKOTViaIframe(data: KOTData): void {
-  const kotContent = generateHTMLKOT(data);
-  
-  const iframe = document.createElement('iframe');
-  iframe.style.position = 'fixed';
-  iframe.style.right = '0';
-  iframe.style.bottom = '0';
-  iframe.style.width = '0';
-  iframe.style.height = '0';
-  iframe.style.border = '0';
-  iframe.style.visibility = 'hidden';
-  document.body.appendChild(iframe);
-
-  const iframeDoc = iframe.contentDocument || iframe.contentWindow?.document;
-  if (iframeDoc) {
-    iframeDoc.open();
-    iframeDoc.write(kotContent);
-    iframeDoc.close();
-
-    iframe.onload = () => {
-      setTimeout(() => {
-        // Must run inside this handler: the height is only known once the ticket
-        // has laid out, and the page box has to be pinned before print() below.
-        try {
-          const frameWindow = iframe.contentWindow;
-          if (frameWindow) applyExactPageSize(frameWindow);
-        } catch (e) {
-          // Falls back to the sheet's own @page rule rather than losing the print.
-          console.warn('Could not pin the KOT page size:', e);
-        }
-
-        try {
-          iframe.contentWindow?.focus();
-          iframe.contentWindow?.print();
-        } catch (e) {
-          console.error('KOT Print failed:', e);
-          alert('KOT Print failed. Please check your printer connection.');
-        }
-        setTimeout(() => {
-          if (document.body.contains(iframe)) {
-            document.body.removeChild(iframe);
-          }
-        }, 3000);
-      }, 500);
-    };
-  }
+function printKOTViaIframe(data: KOTData): Promise<boolean> {
+  return printHTML(generateHTMLKOT(data));
 }
 
 /**

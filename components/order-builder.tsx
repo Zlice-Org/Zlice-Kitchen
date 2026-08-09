@@ -32,6 +32,7 @@ import {
 } from "@/lib/printer/pwa-printer";
 import { printQueue } from "@/lib/printer/print-queue";
 import { printKOT, type KOTData } from "@/lib/printer/kot-printer";
+import { printHTML } from "@/lib/printer/html-print";
 import {
   Dialog,
   DialogContent,
@@ -964,34 +965,9 @@ export function OrderBuilder({ onOrderCreated }: OrderBuilderProps) {
       </html>
     `;
 
-    const iframe = document.createElement("iframe");
-    // Mobile-friendly hidden iframe approach
-    iframe.style.position = "fixed";
-    iframe.style.right = "0";
-    iframe.style.bottom = "0";
-    iframe.style.width = "0";
-    iframe.style.height = "0";
-    iframe.style.border = "0";
-    document.body.appendChild(iframe);
-
-    const iframeDoc = iframe.contentDocument || iframe.contentWindow?.document;
-    if (iframeDoc) {
-      iframeDoc.open();
-      iframeDoc.write(billContent);
-      iframeDoc.close();
-
-      iframe.onload = () => {
-        try {
-          iframe.contentWindow?.focus();
-          iframe.contentWindow?.print();
-        } catch (e) {
-          console.error("Print failed:", e);
-        }
-        setTimeout(() => {
-          document.body.removeChild(iframe);
-        }, 1000);
-      };
-    }
+    // See printBillSilently: printHTML() owns the iframe lifecycle so the frame
+    // outlives the job instead of being torn down on a timer.
+    void printHTML(billContent);
   };
 
   // Detailed print function for order manager (kept for print button in right panel)
@@ -1084,41 +1060,12 @@ export function OrderBuilder({ onOrderCreated }: OrderBuilderProps) {
       </html>
     `;
 
-    const iframe = document.createElement("iframe");
-    iframe.style.position = "fixed";
-    iframe.style.right = "0";
-    iframe.style.bottom = "0";
-    iframe.style.width = "0";
-    iframe.style.height = "0";
-    iframe.style.border = "0";
-    iframe.style.visibility = "hidden";
-    document.body.appendChild(iframe);
-
-    const iframeDoc = iframe.contentDocument || iframe.contentWindow?.document;
-    if (iframeDoc) {
-      iframeDoc.open();
-      iframeDoc.write(billContent);
-      iframeDoc.close();
-
-      // Wait for content to fully load before printing
-      iframe.onload = () => {
-        setTimeout(() => {
-          try {
-            iframe.contentWindow?.focus();
-            iframe.contentWindow?.print();
-          } catch (e) {
-            console.error("Print failed:", e);
-            alert("Print failed. Please check your printer connection.");
-          }
-          // Extended timeout for mobile printer processing
-          setTimeout(() => {
-            if (document.body.contains(iframe)) {
-              document.body.removeChild(iframe);
-            }
-          }, 3000);
-        }, 500);
-      };
-    }
+    // Delegated to printHTML() rather than driven here: assigning iframe.onload
+    // after iframeDoc.close() can miss the load event entirely, and removing the
+    // frame on a fixed 3s timer tears the source away while the browser is still
+    // generating the job - the printer then gets a partial stream and stalls
+    // waiting for the rest, which wedges the queue until it is power-cycled.
+    void printHTML(billContent);
   };
 
   // ============================================================================

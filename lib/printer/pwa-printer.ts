@@ -5,6 +5,7 @@ import {
   isWebUSBAvailable,
   printRawUSB,
 } from './usb-printer';
+import { printHTML } from './html-print';
 
 /**
  * PWA Printer Utility
@@ -890,7 +891,7 @@ export async function printReceipt(receiptData: ReceiptData): Promise<void> {
   if (!bluetoothEnabled) {
     console.log('ℹ️ Bluetooth printing disabled, using system print dialog');
     showToast('📄 Opening print dialog...', 'info');
-    printViaIframe(receiptData);
+    await printViaIframe(receiptData);
     return;
   }
 
@@ -920,111 +921,30 @@ export async function printReceipt(receiptData: ReceiptData): Promise<void> {
     // Bluetooth not available at all
     console.log('⚠️ Web Bluetooth not available on this browser');
     showToast('⚠️ Bluetooth not supported. Using system print dialog...', 'info');
-    printViaIframe(receiptData);
+    await printViaIframe(receiptData);
   }
 }
 
-/** CSS reference pixel is 1/96in; used to turn a measured height into millimetres. */
-const CSS_PX_PER_INCH = 96;
-const MM_PER_INCH = 25.4;
-
-/** Absorbs sub-millimetre rounding so the tail cannot spill onto a second strip. */
-const PAGE_SLACK_MM = 2;
-
-/** Stops a runaway measurement from feeding metres of blank paper. */
-const MAX_PAGE_HEIGHT_MM = 1200;
-
-/** Roll width these receipts are laid out for. */
-const DEFAULT_PAGE_WIDTH_MM = 58;
-
 /**
- * Pins the page box to the roll width and the receipt's own height. Shared by the
- * bill and KOT iframe print paths.
+ * Fallback: browser print dialog.
  *
- * The stylesheets used to declare a size of 58mm paired with auto, which looks
- * right and is invalid: the CSS grammar is <length>{1,2} | auto | <page-size>, so
- * a length paired with auto matches nothing and the browser drops the whole
- * declaration. Chrome then fell back to the driver's default paper, laid the
- * receipt out on US Letter, and the thermal driver printed only the top-left
- * fragment that fitted the 58mm head - a bill truncated just after the header,
- * identically on Windows and Linux, with the queue left waiting for the rest.
+ * Delegates to printHTML() rather than driving an iframe here. The hand-rolled
+ * version this replaces carried two faults that both ended as a bill truncated
+ * after the header:
  *
- * Measuring the content and emitting an explicit two-value size keeps the whole
- * receipt on exactly one page with no trailing blank feed. Screen and print layout
- * are the same here (the sheets only restate the 58mm width for print), so a
- * screen-context measurement is accurate.
+ * 1. `iframe.onload` was assigned AFTER `iframeDoc.close()`. close() fires the
+ *    load event synchronously, so the handler could be attached too late and
+ *    print() was never reached at all.
+ * 2. The iframe was removed on a fixed 3s timer. That tore the source document
+ *    away while the browser was still generating the job, so the printer got a
+ *    partial stream and sat waiting for bytes that never arrived - wedging the
+ *    queue until it was power-cycled.
+ *
+ * printHTML() attaches the load listener before navigating and holds the frame
+ * until `afterprint`, and pins the page box to the measured height.
  */
-export function applyExactPageSize(
-  frameWindow: Window,
-  pageWidthMm: number = DEFAULT_PAGE_WIDTH_MM,
-): void {
-  const doc = frameWindow.document;
-  const contentPx = Math.max(
-    doc.documentElement?.scrollHeight ?? 0,
-    doc.body?.scrollHeight ?? 0,
-  );
-  if (contentPx <= 0) return;
-
-  const heightMm = Math.min(
-    Math.ceil((contentPx * MM_PER_INCH) / CSS_PX_PER_INCH) + PAGE_SLACK_MM,
-    MAX_PAGE_HEIGHT_MM,
-  );
-
-  const style = doc.createElement('style');
-  // Appended last so it wins over the sheet baked into the receipt HTML.
-  style.textContent = `@page { size: ${pageWidthMm}mm ${heightMm}mm; margin: 0; }`;
-  doc.head.appendChild(style);
-}
-
-/**
- * Fallback: Traditional iframe printing (your current method)
- */
-function printViaIframe(data: ReceiptData): void {
-  const billContent = generateHTMLReceipt(data);
-  
-  const iframe = document.createElement('iframe');
-  iframe.style.position = 'fixed';
-  iframe.style.right = '0';
-  iframe.style.bottom = '0';
-  iframe.style.width = '0';
-  iframe.style.height = '0';
-  iframe.style.border = '0';
-  iframe.style.visibility = 'hidden';
-  document.body.appendChild(iframe);
-
-  const iframeDoc = iframe.contentDocument || iframe.contentWindow?.document;
-  if (iframeDoc) {
-    iframeDoc.open();
-    iframeDoc.write(billContent);
-    iframeDoc.close();
-
-    iframe.onload = () => {
-      setTimeout(() => {
-        // Must run inside this handler: the height is only known once the receipt
-        // has laid out, and the page box has to be pinned before print() below.
-        try {
-          const frameWindow = iframe.contentWindow;
-          if (frameWindow) applyExactPageSize(frameWindow);
-        } catch (e) {
-          // Falls back to the sheet's own @page rule rather than losing the print.
-          console.warn('Could not pin the page size:', e);
-        }
-
-        try {
-          iframe.contentWindow?.focus();
-          iframe.contentWindow?.print();
-        } catch (e) {
-          console.error('Print failed:', e);
-          alert('Print failed. Please check your printer connection.');
-        }
-        setTimeout(() => {
-          if (document.body.contains(iframe)) {
-            document.body.removeChild(iframe);
-          }
-        }, 3000);
-      }, 500);
-    };
-  }
+function printViaIframe(data: ReceiptData): Promise<boolean> {
+  return printHTML(generateHTMLReceipt(data));
 }
 
 /**
