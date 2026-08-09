@@ -27,7 +27,7 @@ browser print dialog when both wire transports are unavailable.
 │            ├──1──► WebUSB          ──► claimInterface ──► bulk OUT ──► ROLL │
 │            │       (only if already granted - never opens a chooser)        │
 │            │                                                                │
-│            ├──2──► Web Bluetooth   ──► GATT characteristic     ────────► ROLL │
+│            ├──2──► Web Bluetooth   ──► GATT characteristic ─────────► ROLL  │
 │            │       (paired BLE printer, unless disabled in Settings)        │
 │            │                                                                │
 │            └──3──► null ──► printHTML() ──► browser print dialog ──► OS     │
@@ -70,7 +70,7 @@ mid-order print never pops a device chooser at the counter.
 | `lib/printer/usb-printer.ts` | WebUSB transport: pairing, silent re-acquire, raw byte writes |
 | `lib/printer/pwa-printer.ts` | Bill ESC/POS builder, Bluetooth transport, `sendRawToPrinter()` |
 | `lib/printer/kot-printer.ts` | KOT ESC/POS builder and its HTML fallback sheet |
-| `lib/printer/html-print.ts` | Off-screen iframe that drives the browser print dialog |
+| `lib/printer/html-print.ts` | Off-screen iframe that drives the browser print dialog, and pins the `@page` box to the roll width and the measured receipt height |
 | `components/printer-settings.tsx` | Printer Settings card on `/settings` (pair, forget, test print) |
 
 Saved state lives in `localStorage`, per browser profile and per origin:
@@ -239,6 +239,8 @@ SUBSYSTEM=="usb", ATTRS{idVendor}=="0416", ATTRS{idProduct}=="5011", MODE="0660"
 | Text runs off the right edge (raw ESC/POS path) | Font and column count are out of step. A 58mm head is 384 dots, so Font A (12 dots wide) gives 32 columns and Font B (9 dots) gives 42. The bill is laid out at 42 and depends on `ESC M 1` selecting Font B; a printer left in — or reverting to — Font A wraps every separator and total at column 32 | Confirm `ESC @` is followed by `ESC M 1` in `buildESCPOSCommands()`. If the printer's firmware ignores `ESC M`, lay the bill out at 32 columns the way `kot-printer.ts` does |
 | Paper feeds but comes out blank | Thermal paper is loaded with the coated side away from the head | Reload the roll so it feeds off the **bottom** of the roll, coated side up. Scratch a corner with a fingernail: the coated side marks grey |
 | Chrome still shows the print dialog despite `--kiosk-printing` | The flag is only read at process start, and an already-running Chrome reuses the existing process | Close every Chrome window (check the tray), then relaunch from the shortcut. Confirm the flag is listed on `chrome://version` under *Command Line* |
+| The receipt prints **rotated 90 degrees**, or shrunk to tiny text and clipped on the left | The driver's selected paper is **shorter than the receipt**, so the print pipeline scales the page down to make it fit — and auto-rotates it when the page is nearer square than the paper. Nothing to do with the receipt HTML: the same document prints correctly once the paper matches. On Linux this is the CUPS queue's `PageSize`; the `zj-58` PPD ships defaulting to `58mm x 65mm`, which mangles every bill. On Windows it is the vendor driver's **Paper Size** | Set the paper to something at least as tall as a bill. Linux: `sudo lpadmin -p <queue> -o PageSize=X48MMY297MM -o fit-to-page=false`, verify with `lpoptions -p <queue> -l \| grep PageSize` (the active one is starred). Windows: **Printers & scanners → your printer → Printing preferences → Paper Size → 58 x 297mm** (or the roll option). Diagnostic: if the *content* is right but the *scale or angle* is wrong, it is always the paper size, never the app |
+| Every bill is followed by a long blank feed | The driver's paper is much taller than the bill and the printer advances the full page. The `zj-58` PPD only offers fixed lengths — 65 / 105 / 210 / 297 / 3276mm — with no variable roll length, so a 240mm bill on a 297mm page wastes ~57mm | Pick the smallest listed size that still clears your longest bill, or pass an exact size per job (`lp -o PageSize=Custom.58x240mm`) since the PPD sets `*VariablePaperSize: True`. The raw ESC/POS path has no page concept and feeds only what it prints — that is the only way to get zero waste |
 
 ## Paper Geometry Reference
 
@@ -250,6 +252,7 @@ SUBSYSTEM=="usb", ATTRS{idVendor}=="0416", ATTRS{idProduct}=="5011", MODE="0660"
 | Font A (12 x 24 dots) | **32 characters per line** — printer default after `ESC @`; used by the KOT |
 | Font B (9 x 17 dots) | 42 characters per line — selected with `ESC M 1`; used by the bill |
 | Feed for tear-off | ~4 blank lines (the builders emit these instead of `GS V`, which many 58mm units ignore) |
+| Print-dialog page box | `58mm x 297mm` static floor, replaced at print time with `58mm x` the measured content height |
 
 How the code uses that geometry:
 
@@ -264,6 +267,12 @@ How the code uses that geometry:
   driver's default paper (US Letter), which is what makes a 58mm printer emit only the
   header before stalling. Verified in Chrome: the rule serialises back as
   `@page { margin: 0px; }` with `size` stripped.
+- The override is `applyExactPageSize()` in `html-print.ts`, appended last so it beats the
+  sheet baked into the receipt HTML. Its constants live in the same file: 58mm default
+  width, `+2mm` slack to absorb rounding so the tail cannot spill onto a second strip, and
+  a 1200mm ceiling so a runaway measurement cannot feed metres of blank paper. A failure
+  there is caught and logged (`🖨️ Could not pin the page size:`), falling back to the
+  sheet's own rule rather than losing the print.
 - **A non-zero `@page` margin is what clips the right edge**: it shrinks the page box
   below the 58mm-wide body, and the overflow has nowhere to go. Side spacing belongs in
   the body's `padding` (currently `3mm`), which sits inside the page box.
