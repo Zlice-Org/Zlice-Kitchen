@@ -789,11 +789,109 @@ function buildESCPOSCommands(data: ReceiptData): Uint8Array {
   return new Uint8Array(commands);
 }
 
+/**
+ * Tail of the print chain. Every job links onto it so only one runs at a time.
+ */
+let printChain: Promise<unknown> = Promise.resolve();
+
+/**
+ * Jobs queued or running, keyed by document identity. Dynamic and cleared as
+ * jobs settle, so a Map rather than a static lookup.
+ */
+const inFlightPrints = new Map<string, Promise<unknown>>();
+
+/**
+ * Serialises print jobs, and collapses an accidental double-click.
+ *
+ * The Bill and KOT buttons call async handlers without awaiting, so a
+ * double-click - routine at a busy counter - started two jobs at once, and they
+ * raced: two jobs on one USB interface or BLE characteristic interleave their
+ * writes so the printer receives a spliced ESC/POS stream, and two overlapping
+ * dialog prints both listen for `afterprint` on the shared window, so the first
+ * dialog closing releases the second job's iframe mid-generation.
+ *
+ * `dedupeKey` drops the duplicate click onto the job already queued. The entry
+ * clears as soon as that job settles, so a deliberate reprint a moment later
+ * still prints.
+ */
+export function serialisePrint<T>(job: () => Promise<T>, dedupeKey?: string): Promise<T> {
+  if (dedupeKey !== undefined) {
+    const queued = inFlightPrints.get(dedupeKey) as Promise<T> | undefined;
+    if (queued) return queued;
+  }
+
+  const result = printChain.then(job, job);
+  printChain = result.catch(() => undefined);
+
+  if (dedupeKey !== undefined) {
+    inFlightPrints.set(dedupeKey, result);
+    void result
+      .catch(() => undefined)
+      .then(() => {
+        // Guard against clearing a newer job that reused the key.
+        if (inFlightPrints.get(dedupeKey) === result) inFlightPrints.delete(dedupeKey);
+      });
+  }
+
+  return result;
+}
+
+/**
+ * The few non-ASCII glyphs real menu/canteen data actually contains, mapped to
+ * something the printer's built-in font can render.
+ */
+const ESCPOS_SUBSTITUTIONS: Record<string, string> = {
+  '₹': 'Rs',
+  '×': 'x',
+  '–': '-',
+  '—': '-',
+  '‘': "'",
+  '’': "'",
+  '“': '"',
+  '”': '"',
+  '…': '...',
+  '•': '*',
+};
+
+/**
+ * Reduces text to bytes this printer can actually render.
+ *
+ * The stream is emitted with charCodeAt(), so any code point above 0x7e was
+ * silently truncated to its low byte: 'Rs' (U+20B9) arrived as 0xB9, a coffee
+ * emoji (U+2615) as a raw 0x15 CONTROL byte, and astral emoji such as U+1F357
+ * split into two surrogates that printed as "<W". Every item on the live menu
+ * carries an emoji, so this corrupted the name on every thermal bill and KOT.
+ *
+ * It also broke the column arithmetic the layout depends on, because JS .length
+ * counts UTF-16 units - an astral emoji measured 2 against 1 column of reality,
+ * pushing lines past the width so the printer wrapped them.
+ *
+ * `collapseGaps` must stay false for text already padded into columns; squeezing
+ * those runs of spaces would destroy the layout.
+ */
+export function toEscPosAscii(text: string, collapseGaps: boolean): string {
+  let out = '';
+  // for..of walks code points, so an astral emoji is dropped as one unit rather
+  // than as two broken halves.
+  for (const ch of text) {
+    const replacement = ESCPOS_SUBSTITUTIONS[ch];
+    if (replacement !== undefined) {
+      out += replacement;
+      continue;
+    }
+    const cp = ch.codePointAt(0) ?? 0;
+    if (cp >= 0x20 && cp <= 0x7e) out += ch;
+  }
+  return collapseGaps ? out.replace(/ {2,}/g, ' ').trim() : out;
+}
+
 // Justify left and right within width
 function justifyLR(left: string, right: string, width: number): string {
-  const space = width - left.length - right.length;
-  if (space < 1) return (left + ' ' + right).substring(0, width);
-  return left + ' '.repeat(space) + right;
+  const l = toEscPosAscii(left, true);
+  const r = toEscPosAscii(right, true);
+  const space = width - l.length - r.length;
+  if (space < 1) return (l + ' ' + r).substring(0, width);
+  return l + ' '.repeat(space) + r;
 }
 
 // Justify 3 columns (ITEM, QTY, AMT header)
@@ -802,25 +900,31 @@ function justifyLine(col1: string, col2: string, col3: string, width: number): s
   return col1.padEnd(16) + col2.padStart(8) + col3.padStart(8);
 }
 
-// Format item: name left, qty center, amount right (total = 32 chars)
+// Format item: name left, qty center, amount right (total = width chars)
 function formatItem(name: string, qty: number, amt: number, width: number): string {
   const qtyStr = `x${qty}`;
-  const amtStr = `Rs${amt.toFixed(0)}`;
+  // Two decimals to match the HTML sheet. toFixed(0) silently dropped paise, so
+  // a 99.99 item printed as "Rs99" on the thermal bill while the preview and the
+  // totals below both said 99.99 - the customer got a bill that did not add up.
+  const amtStr = `Rs${amt.toFixed(2)}`;
   const nameWidth = width - qtyStr.length - amtStr.length - 2; // 2 spaces
-  
-  const truncName = name.length > nameWidth 
-    ? name.substring(0, nameWidth - 1) + '.' 
-    : name;
-  
+
+  // Sanitised before measuring: an emoji-prefixed name measured wider than it
+  // prints and pushed the row past `width`.
+  const safeName = toEscPosAscii(name, true);
+  const truncName = safeName.length > nameWidth
+    ? safeName.substring(0, nameWidth - 1) + '.'
+    : safeName;
+
   return justifyLR(truncName, `${qtyStr}  ${amtStr}`, width);
 }
 
 // Wrap long text into multiple lines
 function wrapText(text: string, width: number): string[] {
-  const words = text.split(' ');
+  const words = toEscPosAscii(text, true).split(' ');
   const lines: string[] = [];
   let currentLine = '';
-  
+
   words.forEach(word => {
     if ((currentLine + ' ' + word).trim().length <= width) {
       currentLine = (currentLine + ' ' + word).trim();
@@ -830,13 +934,16 @@ function wrapText(text: string, width: number): string[] {
     }
   });
   if (currentLine) lines.push(currentLine);
-  
+
   return lines;
 }
 
 function addText(commands: number[], text: string) {
-  for (let i = 0; i < text.length; i++) {
-    commands.push(text.charCodeAt(i));
+  // Backstop for call sites that pass data straight through (canteen name,
+  // customer name, phone). Gaps preserved: callers may already be padded.
+  const safe = toEscPosAscii(text, false);
+  for (let i = 0; i < safe.length; i++) {
+    commands.push(safe.charCodeAt(i));
   }
 }
 
@@ -868,61 +975,65 @@ function formatBreakdownLine(label: string, amount: number): string {
  * Tries Bluetooth first (if enabled), falls back to window.print()
  */
 export async function printReceipt(receiptData: ReceiptData): Promise<void> {
-  // Check user preference
-  const bluetoothEnabled = typeof localStorage !== 'undefined' 
-    ? JSON.parse(localStorage.getItem('printer-bluetooth-enabled') ?? 'true')
-    : true;
+  return serialisePrint(async () => {
+    // Check user preference
+    const bluetoothEnabled = typeof localStorage !== 'undefined'
+      ? JSON.parse(localStorage.getItem('printer-bluetooth-enabled') ?? 'true')
+      : true;
 
-  console.log('🖨️ Print Request:', {
-    bluetoothEnabled,
-    hasSavedPrinter: !!getSavedPrinterName(),
-    isPWA: isPWAInstalled(),
-    hasWebBluetooth: isWebBluetoothAvailable()
-  });
+    console.log('🖨️ Print Request:', {
+      bluetoothEnabled,
+      hasSavedPrinter: !!getSavedPrinterName(),
+      isPWA: isPWAInstalled(),
+      hasWebBluetooth: isWebBluetoothAvailable()
+    });
 
-  // USB cable first, when one was paired in Settings. Deliberately checked
-  // ahead of the Bluetooth preference: a counter running USB has the Bluetooth
-  // toggle off, and that must not push the bill into the print dialog. When no
-  // USB printer is paired this is a no-op and the Bluetooth flow below runs
-  // exactly as it always has.
-  if (await printViaUSB(buildESCPOSCommands(receiptData))) return;
+    // USB cable first, when one was paired in Settings. Deliberately checked
+    // ahead of the Bluetooth preference: a counter running USB has the Bluetooth
+    // toggle off, and that must not push the bill into the print dialog. When no
+    // USB printer is paired this is a no-op and the Bluetooth flow below runs
+    // exactly as it always has.
+    if (await printViaUSB(buildESCPOSCommands(receiptData))) return;
 
-  // If Bluetooth is disabled, go straight to window.print()
-  if (!bluetoothEnabled) {
-    console.log('ℹ️ Bluetooth printing disabled, using system print dialog');
-    showToast('📄 Opening print dialog...', 'info');
-    await printViaIframe(receiptData);
-    return;
-  }
-
-  // If Bluetooth is enabled, only try Bluetooth (no fallback unless disabled)
-  if (isWebBluetoothAvailable()) {
-    console.log('🔵 Attempting Bluetooth print...');
-    
-    try {
-      const success = await printViaBluetoothESCPOS(receiptData);
-      
-      if (success) {
-        console.log('✅ Bluetooth print completed successfully');
-        return; // Exit - do NOT fall back
-      }
-      
-      // If Bluetooth failed, show error but DON'T fallback automatically
-      console.log('❌ Bluetooth print failed');
-      showToast('❌ Bluetooth print failed. Check printer or disable Bluetooth printing in settings.', 'error');
-      return; // Don't fallback - user needs to fix Bluetooth or disable it
-      
-    } catch (error) {
-      console.error('❌ Bluetooth exception:', error);
-      showToast('❌ Bluetooth error. Disable Bluetooth printing in settings to use system dialog.', 'error');
-      return; // Don't fallback
+    // If Bluetooth is disabled, go straight to window.print()
+    if (!bluetoothEnabled) {
+      console.log('ℹ️ Bluetooth printing disabled, using system print dialog');
+      showToast('📄 Opening print dialog...', 'info');
+      await printViaIframe(receiptData);
+      return;
     }
-  } else {
+
+    if (isWebBluetoothAvailable()) {
+      console.log('🔵 Attempting Bluetooth print...');
+
+      try {
+        const success = await printViaBluetoothESCPOS(receiptData);
+
+        if (success) {
+          console.log('✅ Bluetooth print completed successfully');
+          return;
+        }
+
+        console.log('❌ Bluetooth print failed');
+        showToast('❌ Bluetooth print failed - using the print dialog. Check the printer, or turn Bluetooth printing off in settings.', 'error');
+      } catch (error) {
+        console.error('❌ Bluetooth exception:', error);
+        showToast('❌ Bluetooth error - using the print dialog. Turn Bluetooth printing off in settings to stop this.', 'error');
+      }
+
+      // Previously this returned here, so an enabled-but-broken Bluetooth
+      // printer silently swallowed the bill and the counter had nothing to hand
+      // the customer. The toast above still surfaces the Bluetooth fault; losing
+      // the sale on top of it was never the useful half of that behaviour.
+      await printViaIframe(receiptData);
+      return;
+    }
+
     // Bluetooth not available at all
     console.log('⚠️ Web Bluetooth not available on this browser');
     showToast('⚠️ Bluetooth not supported. Using system print dialog...', 'info');
     await printViaIframe(receiptData);
-  }
+  }, `bill:${receiptData.serialNumber ?? receiptData.orderNumber}`);
 }
 
 /**

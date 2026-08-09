@@ -27,7 +27,7 @@ export interface KOTData {
 }
 
 // Import shared helpers from billing printer
-import { isWebBluetoothAvailable, printRawData, printViaUSB, getSavedPrinterId as getSharedPrinterId } from './pwa-printer';
+import { isWebBluetoothAvailable, printRawData, printViaUSB, getSavedPrinterId as getSharedPrinterId, toEscPosAscii, serialisePrint } from './pwa-printer';
 import { printHTML } from './html-print';
 
 // Get saved printer ID (SHARED with billing)
@@ -100,39 +100,41 @@ async function printKOTViaBluetooth(kotData: KOTData): Promise<boolean> {
  * Respects Bluetooth toggle - if OFF, uses HTML only (NO dialog)
  */
 export async function printKOT(kotData: KOTData, forceThermal?: boolean) {
-  // USB cable first, when one was paired in Settings. Checked ahead of the
-  // Bluetooth toggle on purpose: a counter running USB keeps Bluetooth off, and
-  // that must not push the ticket into the print dialog. A no-op when no USB
-  // printer is paired, so the Bluetooth flow below is unchanged.
-  if (forceThermal !== false && (await printViaUSB(buildKOTESCPOSCommands(kotData)))) return;
+  // Shares the bill's chain so a bill and a ticket fired together cannot
+  // interleave their bytes on the same printer.
+  return serialisePrint(async () => {
+    // USB cable first, when one was paired in Settings. Checked ahead of the
+    // Bluetooth toggle on purpose: a counter running USB keeps Bluetooth off, and
+    // that must not push the ticket into the print dialog. A no-op when no USB
+    // printer is paired, so the Bluetooth flow below is unchanged.
+    if (forceThermal !== false && (await printViaUSB(buildKOTESCPOSCommands(kotData)))) return;
 
-  const bluetoothEnabled = isBluetoothEnabled();
-  
-  // If Bluetooth is disabled, skip thermal and go straight to HTML
-  if (!bluetoothEnabled) {
-    console.log('📄 Bluetooth disabled - using HTML print');
-    await printKOTViaIframe(kotData);
-    return;
-  }
-  
-  // If Bluetooth is enabled, try thermal first
-  if (forceThermal !== false) {
-    const printed = await printKOTViaBluetooth(kotData);
-    if (printed) return;
-    
-    // If we are here, Bluetooth print failed.
-    // If the user hasn't even paired a printer, maybe fallback is okay?
-    // But if they paired and it failed, fallback is annoying.
-    if (getSavedPrinterId()) {
-       console.log('❌ Bluetooth print failed - Not falling back to HTML to avoid dialog spam');
-       showToast('❌ Print failed. Check printer connection.', 'error');
-       // Don't fallback if we expected Bluetooth to work
-       return; 
+    const bluetoothEnabled = isBluetoothEnabled();
+
+    // If Bluetooth is disabled, skip thermal and go straight to HTML
+    if (!bluetoothEnabled) {
+      console.log('📄 Bluetooth disabled - using HTML print');
+      await printKOTViaIframe(kotData);
+      return;
     }
-  }
-  
-  // Fallback to HTML (only if no Bluetooth printer is saved, or Bluetooth is disabled)
-  await printKOTViaIframe(kotData);
+
+    // If Bluetooth is enabled, try thermal first
+    if (forceThermal !== false) {
+      const printed = await printKOTViaBluetooth(kotData);
+      if (printed) return;
+
+      // Bluetooth failed. This used to return without printing whenever a
+      // printer had been paired, on the theory that the dialog was spam - but a
+      // kitchen ticket that never appears is worse than a dialog, because the
+      // order simply does not get cooked. The toast still reports the fault.
+      if (getSavedPrinterId()) {
+        console.log('❌ Bluetooth print failed - using the print dialog instead');
+        showToast('❌ Print failed - using the print dialog. Check the printer connection.', 'error');
+      }
+    }
+
+    await printKOTViaIframe(kotData);
+  }, `kot:${kotData.serialNumber ?? kotData.orderNumber}`);
 }
 
 /**
@@ -150,14 +152,17 @@ function buildKOTESCPOSCommands(data: KOTData): Uint8Array {
   
   commands.push(ESC, 0x40);
   
-  // Header
-  commands.push(ESC, 0x61, 0x01);
-  commands.push(GS, 0x42, 0x01);
-  commands.push(ESC, 0x45, 0x01);
+  // Header - bold, centred, double size. Deliberately NOT GS B (reverse video):
+  // white-on-black requires the unit to invert the whole line, which 58mm
+  // printers commonly render wrong or ignore, and it soaks the paper in ink.
+  // The sibling repo dropped it for the same reason.
+  commands.push(ESC, 0x61, 0x01); // Center align
+  commands.push(ESC, 0x45, 0x01); // Bold on
+  commands.push(GS, 0x21, 0x11);  // Double width & height
   addText(commands, 'ZLICE KOT');
   commands.push(LF);
-  commands.push(GS, 0x42, 0x00);
-  commands.push(ESC, 0x45, 0x00);
+  commands.push(GS, 0x21, 0x00);  // Reset size
+  commands.push(ESC, 0x45, 0x00); // Bold off
   
   // Order number
   commands.push(ESC, 0x45, 0x01);
@@ -280,10 +285,13 @@ function buildKOTESCPOSCommands(data: KOTData): Uint8Array {
 }
 
 function wrapText(text: string, width: number): string[] {
-  const words = text.split(' ');
+  // Sanitised before measuring: kitchen tickets carry the same emoji-prefixed
+  // menu names as the bill, and an astral emoji counts 2 against JS .length
+  // while occupying 1 column, which pushed lines past `width`.
+  const words = toEscPosAscii(text, true).split(' ');
   const lines: string[] = [];
   let currentLine = '';
-  
+
   words.forEach(word => {
     if ((currentLine + ' ' + word).trim().length <= width) {
       currentLine = (currentLine + ' ' + word).trim();
@@ -293,13 +301,16 @@ function wrapText(text: string, width: number): string[] {
     }
   });
   if (currentLine) lines.push(currentLine);
-  
+
   return lines;
 }
 
 function addText(commands: number[], text: string) {
-  for (let i = 0; i < text.length; i++) {
-    commands.push(text.charCodeAt(i));
+  // Backstop so no code point above 0x7e reaches the printer as a truncated low
+  // byte - a coffee emoji arrived as a raw 0x15 control byte.
+  const safe = toEscPosAscii(text, false);
+  for (let i = 0; i < safe.length; i++) {
+    commands.push(safe.charCodeAt(i));
   }
 }
 
