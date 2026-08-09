@@ -1,5 +1,11 @@
 'use client';
 
+import {
+  getAuthorizedUSBPrinter,
+  isWebUSBAvailable,
+  printRawUSB,
+} from './usb-printer';
+
 /**
  * PWA Printer Utility
  * 
@@ -555,6 +561,27 @@ export async function printRawData(commands: Uint8Array): Promise<boolean> {
 }
 
 
+/**
+ * Writes raw ESC/POS bytes down the USB cable when a printer has been paired in
+ * Settings, otherwise reports false so the caller drops through to its existing
+ * Bluetooth path untouched.
+ *
+ * Silent by design: getAuthorizedUSBPrinter() only ever returns a device the
+ * user already granted, so this can never pop a device chooser mid-order.
+ */
+export async function printViaUSB(commands: Uint8Array): Promise<boolean> {
+  if (!isWebUSBAvailable()) return false;
+  if (!(await getAuthorizedUSBPrinter())) return false;
+
+  if (await printRawUSB(commands)) {
+    showToast('✅ Printed successfully', 'success');
+    return true;
+  }
+
+  showToast('⚠️ USB printer did not respond - trying Bluetooth', 'info');
+  return false;
+}
+
 export async function printViaBluetoothESCPOS(receiptData: ReceiptData): Promise<boolean> {
     console.log('🖨️ Building print commands...');
     const commands = buildESCPOSCommands(receiptData);
@@ -571,9 +598,13 @@ function buildESCPOSCommands(data: ReceiptData): Uint8Array {
   const GS = 0x1D;
   const LF = 0x0A;
   
-  // 58mm thermal usually 32-42 chars depending on font.
-  // User requested "less margin" (wider text area) and "larger fonts" (double height).
-  const W = 42; 
+  // Column count and font MUST be chosen together. A 58mm head is 384 dots, so
+  // Font A (12 dots wide) gives 32 columns and Font B (9 dots) gives 42. This
+  // layout is built at 42, which only holds once ESC M 1 has selected Font B -
+  // without it the printer stays in Font A after ESC @ and every separator,
+  // item and total row wraps at column 32, shredding the bill into ragged
+  // half-lines. The KOT sheet is laid out at 32 and stays in Font A.
+  const W = 42;
   const LINE = '-'.repeat(W);
   const DLINE = '='.repeat(W);
   
@@ -581,6 +612,7 @@ function buildESCPOSCommands(data: ReceiptData): Uint8Array {
   
   // Initialize printer
   commands.push(ESC, 0x40);
+  commands.push(ESC, 0x4d, 0x01); // Font B: 42 columns, matching W above.
   
   // ========== HEADER - ZLICE BRANDING ==========
   commands.push(ESC, 0x61, 0x01); // Center align
@@ -670,7 +702,10 @@ function buildESCPOSCommands(data: ReceiptData): Uint8Array {
   // ========== ITEMS TABLE ==========
   commands.push(ESC, 0x61, 0x01); // Center align for table
   commands.push(ESC, 0x45, 0x01); // Bold header
-  addText(commands, 'ITEM            QTY      AMT');
+  // Built from W, not a fixed literal: the item rows below are justified to W,
+  // so a hardcoded 28-char header floated centred above 42-char rows and put
+  // QTY/AMT nowhere near the columns they label.
+  addText(commands, justifyLR('ITEM', 'QTY      AMT', W));
   commands.push(ESC, 0x45, 0x00);
   commands.push(LF);
   addText(commands, LINE);
@@ -844,6 +879,13 @@ export async function printReceipt(receiptData: ReceiptData): Promise<void> {
     hasWebBluetooth: isWebBluetoothAvailable()
   });
 
+  // USB cable first, when one was paired in Settings. Deliberately checked
+  // ahead of the Bluetooth preference: a counter running USB has the Bluetooth
+  // toggle off, and that must not push the bill into the print dialog. When no
+  // USB printer is paired this is a no-op and the Bluetooth flow below runs
+  // exactly as it always has.
+  if (await printViaUSB(buildESCPOSCommands(receiptData))) return;
+
   // If Bluetooth is disabled, go straight to window.print()
   if (!bluetoothEnabled) {
     console.log('ℹ️ Bluetooth printing disabled, using system print dialog');
@@ -951,7 +993,11 @@ function generateHTMLReceipt(data: ReceiptData): string {
       <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         
-        @page { size: 58mm auto; margin: 2mm; }
+        /* margin must stay 0: a non-zero @page margin shrinks the page box below
+           the 58mm body below it, and the overflow is either clipped on the right
+           or spilled onto a second strip of paper. Side spacing is the body's
+           padding instead, which is inside the page box. */
+        @page { size: 58mm auto; margin: 0; }
         
         @media print {
           html, body { width: 58mm !important; max-width: 58mm !important; }

@@ -27,7 +27,7 @@ export interface KOTData {
 }
 
 // Import shared helpers from billing printer
-import { isWebBluetoothAvailable, printRawData, getSavedPrinterId as getSharedPrinterId } from './pwa-printer';
+import { isWebBluetoothAvailable, printRawData, printViaUSB, getSavedPrinterId as getSharedPrinterId } from './pwa-printer';
 
 // Get saved printer ID (SHARED with billing)
 function getSavedPrinterId(): string | null {
@@ -99,6 +99,12 @@ async function printKOTViaBluetooth(kotData: KOTData): Promise<boolean> {
  * Respects Bluetooth toggle - if OFF, uses HTML only (NO dialog)
  */
 export async function printKOT(kotData: KOTData, forceThermal?: boolean) {
+  // USB cable first, when one was paired in Settings. Checked ahead of the
+  // Bluetooth toggle on purpose: a counter running USB keeps Bluetooth off, and
+  // that must not push the ticket into the print dialog. A no-op when no USB
+  // printer is paired, so the Bluetooth flow below is unchanged.
+  if (forceThermal !== false && (await printViaUSB(buildKOTESCPOSCommands(kotData)))) return;
+
   const bluetoothEnabled = isBluetoothEnabled();
   
   // If Bluetooth is disabled, skip thermal and go straight to HTML
