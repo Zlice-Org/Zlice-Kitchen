@@ -27,7 +27,7 @@ export interface KOTData {
 }
 
 // Import shared helpers from billing printer
-import { isWebBluetoothAvailable, printRawData, printViaUSB, getSavedPrinterId as getSharedPrinterId } from './pwa-printer';
+import { isWebBluetoothAvailable, printRawData, printViaUSB, getSavedPrinterId as getSharedPrinterId, applyExactPageSize } from './pwa-printer';
 
 // Get saved printer ID (SHARED with billing)
 function getSavedPrinterId(): string | null {
@@ -326,6 +326,16 @@ function printKOTViaIframe(data: KOTData): void {
 
     iframe.onload = () => {
       setTimeout(() => {
+        // Must run inside this handler: the height is only known once the ticket
+        // has laid out, and the page box has to be pinned before print() below.
+        try {
+          const frameWindow = iframe.contentWindow;
+          if (frameWindow) applyExactPageSize(frameWindow);
+        } catch (e) {
+          // Falls back to the sheet's own @page rule rather than losing the print.
+          console.warn('Could not pin the KOT page size:', e);
+        }
+
         try {
           iframe.contentWindow?.focus();
           iframe.contentWindow?.print();
@@ -367,8 +377,15 @@ function generateHTMLKOT(data: KOTData): string {
       <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         
+        /* Two explicit lengths, never a length paired with 'auto': that pairing is
+           invalid per the CSS 'size' grammar, so the browser drops the whole
+           declaration and falls back to the driver's default paper (US Letter),
+           which a 58mm thermal driver renders as just the top fragment - the ticket
+           truncated after the header. applyExactPageSize() replaces this at print
+           time with the measured content height; this value is only the fallback,
+           and the margin must stay 0 so the 58mm body cannot overflow the page box. */
         @page { 
-          size: 58mm auto; 
+          size: 58mm 297mm; 
           margin: 0;
         }
         

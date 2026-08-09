@@ -924,6 +924,58 @@ export async function printReceipt(receiptData: ReceiptData): Promise<void> {
   }
 }
 
+/** CSS reference pixel is 1/96in; used to turn a measured height into millimetres. */
+const CSS_PX_PER_INCH = 96;
+const MM_PER_INCH = 25.4;
+
+/** Absorbs sub-millimetre rounding so the tail cannot spill onto a second strip. */
+const PAGE_SLACK_MM = 2;
+
+/** Stops a runaway measurement from feeding metres of blank paper. */
+const MAX_PAGE_HEIGHT_MM = 1200;
+
+/** Roll width these receipts are laid out for. */
+const DEFAULT_PAGE_WIDTH_MM = 58;
+
+/**
+ * Pins the page box to the roll width and the receipt's own height. Shared by the
+ * bill and KOT iframe print paths.
+ *
+ * The stylesheets used to declare a size of 58mm paired with auto, which looks
+ * right and is invalid: the CSS grammar is <length>{1,2} | auto | <page-size>, so
+ * a length paired with auto matches nothing and the browser drops the whole
+ * declaration. Chrome then fell back to the driver's default paper, laid the
+ * receipt out on US Letter, and the thermal driver printed only the top-left
+ * fragment that fitted the 58mm head - a bill truncated just after the header,
+ * identically on Windows and Linux, with the queue left waiting for the rest.
+ *
+ * Measuring the content and emitting an explicit two-value size keeps the whole
+ * receipt on exactly one page with no trailing blank feed. Screen and print layout
+ * are the same here (the sheets only restate the 58mm width for print), so a
+ * screen-context measurement is accurate.
+ */
+export function applyExactPageSize(
+  frameWindow: Window,
+  pageWidthMm: number = DEFAULT_PAGE_WIDTH_MM,
+): void {
+  const doc = frameWindow.document;
+  const contentPx = Math.max(
+    doc.documentElement?.scrollHeight ?? 0,
+    doc.body?.scrollHeight ?? 0,
+  );
+  if (contentPx <= 0) return;
+
+  const heightMm = Math.min(
+    Math.ceil((contentPx * MM_PER_INCH) / CSS_PX_PER_INCH) + PAGE_SLACK_MM,
+    MAX_PAGE_HEIGHT_MM,
+  );
+
+  const style = doc.createElement('style');
+  // Appended last so it wins over the sheet baked into the receipt HTML.
+  style.textContent = `@page { size: ${pageWidthMm}mm ${heightMm}mm; margin: 0; }`;
+  doc.head.appendChild(style);
+}
+
 /**
  * Fallback: Traditional iframe printing (your current method)
  */
@@ -948,6 +1000,16 @@ function printViaIframe(data: ReceiptData): void {
 
     iframe.onload = () => {
       setTimeout(() => {
+        // Must run inside this handler: the height is only known once the receipt
+        // has laid out, and the page box has to be pinned before print() below.
+        try {
+          const frameWindow = iframe.contentWindow;
+          if (frameWindow) applyExactPageSize(frameWindow);
+        } catch (e) {
+          // Falls back to the sheet's own @page rule rather than losing the print.
+          console.warn('Could not pin the page size:', e);
+        }
+
         try {
           iframe.contentWindow?.focus();
           iframe.contentWindow?.print();
@@ -997,7 +1059,13 @@ function generateHTMLReceipt(data: ReceiptData): string {
            the 58mm body below it, and the overflow is either clipped on the right
            or spilled onto a second strip of paper. Side spacing is the body's
            padding instead, which is inside the page box. */
-        @page { size: 58mm auto; margin: 0; }
+        /* Two explicit lengths, never a length paired with 'auto': that pairing is
+           invalid per the CSS 'size' grammar, so the browser drops the whole
+           declaration and falls back to the driver's default paper (US Letter),
+           which a 58mm thermal driver renders as just the top fragment - the bill
+           truncated after the header. applyExactPageSize() replaces this at print
+           time with the measured content height; this value is only the fallback. */
+        @page { size: 58mm 297mm; margin: 0; }
         
         @media print {
           html, body { width: 58mm !important; max-width: 58mm !important; }

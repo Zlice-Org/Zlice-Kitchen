@@ -920,8 +920,14 @@ export function OrderBuilder({ onOrderCreated }: OrderBuilderProps) {
       <head>
         <title>Order #${orderNumber}</title>
         <style>
+        /* Two explicit lengths, never a length paired with 'auto': that pairing is
+           invalid per the CSS 'size' grammar, so the browser drops the whole
+           declaration and falls back to the driver's default paper (US Letter),
+           which a 58mm thermal driver prints as just the truncated top fragment.
+           297mm is a roll-length ceiling; the margin must stay 0 so the 58mm body
+           cannot overflow the page box. */
         @page {
-          size: 58mm auto;
+          size: 58mm 297mm;
           margin: 0;
         }
         body { 
@@ -999,7 +1005,10 @@ export function OrderBuilder({ onOrderCreated }: OrderBuilderProps) {
         <title>Order #${orderNumber}</title>
         <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        @page { size: 58mm auto; margin: 0; }
+        /* Two explicit lengths, never a length paired with 'auto': that pairing is
+           invalid CSS, so the browser drops the declaration and falls back to the
+           driver's default paper (US Letter), truncating the bill after the header. */
+        @page { size: 58mm 297mm; margin: 0; }
         @media print {
           body { width: 58mm !important; }
           * { -webkit-print-color-adjust: exact !important; color-adjust: exact !important; print-color-adjust: exact !important; }
