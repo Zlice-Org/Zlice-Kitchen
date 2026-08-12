@@ -25,13 +25,9 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Loader2, Save, Clock, Search, Plus, Trash2, Edit2, Package, Bike, UtensilsCrossed, AlertCircle, ShoppingCart, ShoppingBag, Info, RotateCcw, Volume2, VolumeX, CheckSquare, Square, Check, ChefHat, Printer, Ban, Calendar, Minus, BookOpen, X } from 'lucide-react';
-import {
-  printReceipt as printReceiptPWA,
-  type ReceiptData,
-  isBluetoothEnabledAndConnected,
-} from "@/lib/printer/pwa-printer";
-import { printQueue } from "@/lib/printer/print-queue";
+import { printReceipt as printReceiptPWA } from "@/lib/printer/pwa-printer";
 import { printKOT, type KOTData } from "@/lib/printer/kot-printer";
+import { printHTML } from "@/lib/printer/html-print";
 import {
   Dialog,
   DialogContent,
@@ -806,14 +802,7 @@ export function OrderBuilder({ onOrderCreated }: OrderBuilderProps) {
       const orderData = await resp.json();
       const generatedOrderNumber = orderData.orderNumber;
       const serialNumber = orderData.serialNumber;
-      const totalAmt = orderData.items.reduce(
-        (sum: number, item: any) => sum + item.price * item.quantity,
-        0,
-      );
-      const gstAmount = orderData.gstAmount || 0;
       const finalTotal = orderData.totalAmount;
-      const resolvedDeliveryFee = orderData.deliveryFee || 0;
-      const resolvedPackagingFee = orderData.packagingFee || 0;
       const orderId = orderData.orderId;
 
       // Trigger push notifications via webhook (non-blocking)
@@ -842,42 +831,6 @@ export function OrderBuilder({ onOrderCreated }: OrderBuilderProps) {
           // Don't fail the order creation if notification fails
           console.error("⚠️ Failed to send push notification:", err);
         });
-
-      // Prepare receipt data for printing
-      const itemsToPrint = orderItems.map((item) => ({
-        name: item.name,
-        quantity: item.quantity,
-        price: item.canteen_price,
-      }));
-
-      const receiptData: ReceiptData = {
-        canteenName: selectedCanteen?.name,
-        address: selectedCanteen?.address || undefined,
-        phone: selectedCanteen?.phone || undefined,
-        orderNumber: generatedOrderNumber,
-        serialNumber: serialNumber,
-        createdAt: new Date().toISOString(),
-        items: itemsToPrint,
-        subtotal: totalAmt,
-        gst: gstAmount > 0 ? gstAmount : undefined,
-        packagingFee:
-          resolvedPackagingFee > 0 ? resolvedPackagingFee : undefined,
-        deliveryFee: resolvedDeliveryFee > 0 ? resolvedDeliveryFee : undefined,
-        total: finalTotal,
-        orderType: orderType,
-        paymentMethod: paymentStatus,
-      };
-
-      console.log("hi IAM DEBUGGING", receiptData);
-
-      // Queue print job if Bluetooth is connected
-      const bluetoothConnected = await isBluetoothEnabledAndConnected();
-      if (bluetoothConnected) {
-        console.log("Queuing Print Job (Bluetooth connected):", receiptData);
-        await printQueue.addJob(receiptData);
-      } else {
-        console.log("ℹ️ Bluetooth not connected - skipping print queue");
-      }
 
       // Refresh orders list
       await refreshOrders();
@@ -920,8 +873,14 @@ export function OrderBuilder({ onOrderCreated }: OrderBuilderProps) {
       <head>
         <title>Order #${orderNumber}</title>
         <style>
+        /* Two explicit lengths, never a length paired with 'auto': that pairing is
+           invalid per the CSS 'size' grammar, so the browser drops the whole
+           declaration and falls back to the driver's default paper (US Letter),
+           which a 58mm thermal driver prints as just the truncated top fragment.
+           297mm is a roll-length ceiling; the margin must stay 0 so the 58mm body
+           cannot overflow the page box. */
         @page {
-          size: 58mm auto;
+          size: 58mm 297mm;
           margin: 0;
         }
         body { 
@@ -958,34 +917,9 @@ export function OrderBuilder({ onOrderCreated }: OrderBuilderProps) {
       </html>
     `;
 
-    const iframe = document.createElement("iframe");
-    // Mobile-friendly hidden iframe approach
-    iframe.style.position = "fixed";
-    iframe.style.right = "0";
-    iframe.style.bottom = "0";
-    iframe.style.width = "0";
-    iframe.style.height = "0";
-    iframe.style.border = "0";
-    document.body.appendChild(iframe);
-
-    const iframeDoc = iframe.contentDocument || iframe.contentWindow?.document;
-    if (iframeDoc) {
-      iframeDoc.open();
-      iframeDoc.write(billContent);
-      iframeDoc.close();
-
-      iframe.onload = () => {
-        try {
-          iframe.contentWindow?.focus();
-          iframe.contentWindow?.print();
-        } catch (e) {
-          console.error("Print failed:", e);
-        }
-        setTimeout(() => {
-          document.body.removeChild(iframe);
-        }, 1000);
-      };
-    }
+    // See printBillSilently: printHTML() owns the iframe lifecycle so the frame
+    // outlives the job instead of being torn down on a timer.
+    void printHTML(billContent);
   };
 
   // Detailed print function for order manager (kept for print button in right panel)
@@ -999,7 +933,10 @@ export function OrderBuilder({ onOrderCreated }: OrderBuilderProps) {
         <title>Order #${orderNumber}</title>
         <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        @page { size: 58mm auto; margin: 0; }
+        /* Two explicit lengths, never a length paired with 'auto': that pairing is
+           invalid CSS, so the browser drops the declaration and falls back to the
+           driver's default paper (US Letter), truncating the bill after the header. */
+        @page { size: 58mm 297mm; margin: 0; }
         @media print {
           body { width: 58mm !important; }
           * { -webkit-print-color-adjust: exact !important; color-adjust: exact !important; print-color-adjust: exact !important; }
@@ -1075,41 +1012,12 @@ export function OrderBuilder({ onOrderCreated }: OrderBuilderProps) {
       </html>
     `;
 
-    const iframe = document.createElement("iframe");
-    iframe.style.position = "fixed";
-    iframe.style.right = "0";
-    iframe.style.bottom = "0";
-    iframe.style.width = "0";
-    iframe.style.height = "0";
-    iframe.style.border = "0";
-    iframe.style.visibility = "hidden";
-    document.body.appendChild(iframe);
-
-    const iframeDoc = iframe.contentDocument || iframe.contentWindow?.document;
-    if (iframeDoc) {
-      iframeDoc.open();
-      iframeDoc.write(billContent);
-      iframeDoc.close();
-
-      // Wait for content to fully load before printing
-      iframe.onload = () => {
-        setTimeout(() => {
-          try {
-            iframe.contentWindow?.focus();
-            iframe.contentWindow?.print();
-          } catch (e) {
-            console.error("Print failed:", e);
-            alert("Print failed. Please check your printer connection.");
-          }
-          // Extended timeout for mobile printer processing
-          setTimeout(() => {
-            if (document.body.contains(iframe)) {
-              document.body.removeChild(iframe);
-            }
-          }, 3000);
-        }, 500);
-      };
-    }
+    // Delegated to printHTML() rather than driven here: assigning iframe.onload
+    // after iframeDoc.close() can miss the load event entirely, and removing the
+    // frame on a fixed 3s timer tears the source away while the browser is still
+    // generating the job - the printer then gets a partial stream and stalls
+    // waiting for the rest, which wedges the queue until it is power-cycled.
+    void printHTML(billContent);
   };
 
   // ============================================================================
@@ -2760,8 +2668,8 @@ export function OrderBuilder({ onOrderCreated }: OrderBuilderProps) {
                     disabled={loading || orderItems.length === 0}
                     className="bg-red-600 hover:bg-red-700 dark:bg-red-500 dark:hover:bg-red-600 text-white font-semibold col-span-2 h-9 text-xs"
                     size="lg">
-                    <Printer className="w-3 h-3 md:w-4 md:h-4 mr-1 md:mr-2" />
-                    {loading ? "Processing..." : "Print & Submit"}
+                    <ShoppingCart className="w-3 h-3 md:w-4 md:h-4 mr-1 md:mr-2" />
+                    {loading ? "Processing..." : "Submit Order"}
                   </Button>
                   <Button
                     onClick={() => setOrderItems([])}
