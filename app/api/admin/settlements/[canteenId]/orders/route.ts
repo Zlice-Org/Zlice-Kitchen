@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { createClient } from "@/lib/supabase/server";
+import { supabaseAdmin } from "@/lib/supabase/admin";
 import {
   OrderForSettlement,
   calculateOrderSettlement,
@@ -21,7 +21,10 @@ export async function GET(
 ) {
   try {
     const { canteenId } = await params;
-    const supabase = await createClient();
+    // Service-role client: this route is super-admin gated below, and the
+    // `coupon:coupon_id(code)` embed reads canteen_coupons, which has RLS
+    // disabled and so carries no grant for `anon` on RDS (42501).
+    const supabase = supabaseAdmin;
 
     // Authenticate super admin
     const authToken = request.cookies.get("auth_token")?.value;
